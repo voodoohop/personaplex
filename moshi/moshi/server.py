@@ -386,11 +386,6 @@ class ServerState:
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
 
-                        # Don't forward audio/text while injecting tokens
-                        # (injection forces text tokens; the audio is garbage during this)
-                        if self.lm_gen.is_injecting:
-                            continue
-
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
