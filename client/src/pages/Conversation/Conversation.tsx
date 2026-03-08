@@ -154,8 +154,8 @@ export const Conversation:FC<ConversationProps> = ({
   const eventIdRef = useRef(0);
   const eventLogRef = useRef<HTMLDivElement>(null);
 
-  // Floor indicator state (default floor 5)
-  const [currentFloor, setCurrentFloor] = useState(5);
+  // Floor indicator state (default floor 1)
+  const [currentFloor, setCurrentFloor] = useState(1);
 
   // Add event to log (keep last 10)
   const addEvent = useCallback((text: string, kind: EventLogEntry["kind"]) => {
@@ -163,44 +163,55 @@ export const Conversation:FC<ConversationProps> = ({
     setEventLog(prev => [...prev.slice(-9), { id, timestamp: Date.now(), text, kind }]);
   }, []);
 
+  // Extract floor number from result text like "Moving up to floor 4" or "Currently on floor 3"
+  const extractFloorFromResult = useCallback((result: string): number | null => {
+    const match = result.match(/floor\s+(-?\d+)/i);
+    return match ? parseInt(match[1], 10) : null;
+  }, []);
+
   // Process incoming metadata messages for event log and floor tracking
+  // Server sends: {kind: "tool_call", tool: "move_up", result: "Moving up to floor 2"}
+  //               {kind: "assistant_text", text: "..."}
+  //               {kind: "soft_reset", prompt: "..."}
   const handleMetadataEvent = useCallback((data: unknown) => {
     if (!data || typeof data !== "object") return;
     const evt = data as Record<string, unknown>;
+    const evtKind = (evt.kind || evt.type) as string | undefined;
 
-    // Tool call events
-    if (evt.type === "tool_call" || evt.tool_name) {
-      const toolName = (evt.tool_name || evt.name || "unknown") as string;
-      const args = evt.arguments || evt.args;
-      const argsStr = args ? ` (${JSON.stringify(args)})` : "";
-      addEvent(`\u{1F527} ${toolName}${argsStr}`, "tool_call");
+    console.log("Metadata event received:", evt);
 
-      // Track floor changes
-      if (toolName === "move_up") {
-        setCurrentFloor(f => f + 1);
-      } else if (toolName === "move_down") {
-        setCurrentFloor(f => f - 1);
+    // Tool call events (server sends kind:"tool_call" with tool and result fields)
+    if (evtKind === "tool_call") {
+      const toolName = (evt.tool || evt.tool_name || evt.name || "unknown") as string;
+      const result = evt.result as string | undefined;
+      addEvent(`\u{2705} ${result || toolName}`, "tool_result");
+
+      // Extract floor number directly from result text
+      if (result) {
+        const floor = extractFloorFromResult(result);
+        if (floor !== null) {
+          setCurrentFloor(floor);
+        }
       }
+      return;
     }
 
-    // Tool result events
-    if (evt.type === "tool_result" || evt.result !== undefined) {
-      const toolName = (evt.tool_name || evt.name || "") as string;
-      const result = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result);
-      addEvent(`\u{2705} ${toolName ? toolName + " \u2192 " : ""}${result}`, "tool_result");
-    }
-
-    // Transcript events
-    if (evt.type === "transcript" || evt.transcript) {
-      const text = (evt.transcript || evt.text || "") as string;
+    // Assistant text events
+    if (evtKind === "assistant_text") {
+      const text = (evt.text || "") as string;
       if (text) addEvent(`\u{1F4AC} ${text}`, "transcript");
+      return;
     }
 
     // Soft reset confirmation
-    if (evt.type === "soft_reset" || evt.type === "reset_confirmed") {
+    if (evtKind === "soft_reset" || evtKind === "reset_confirmed") {
       addEvent(`\u{1F504} Persona reset confirmed`, "reset");
+      return;
     }
-  }, [addEvent]);
+
+    // Fallback: log unknown events for debugging
+    console.log("Unknown metadata event kind:", evtKind, evt);
+  }, [addEvent, extractFloorFromResult]);
 
   const WSURL = buildURL({
     workerAddr,
