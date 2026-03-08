@@ -13,6 +13,39 @@ import { ModelParamsValues, useModelParams } from "./hooks/useModelParams";
 import fixWebmDuration from "webm-duration-fix";
 import { getMimeType, getExtension } from "./getMimeType";
 import { type ThemeType } from "./hooks/useSystemTheme";
+import { WSMessage } from "../../protocol/types";
+
+// Persona presets for soft reset
+const PERSONA_PRESETS = [
+  {
+    label: "Happy Elevator",
+    emoji: "😄",
+    prompt: "You are the Happy Vertical People Transporter, an elevator made by the Sirius Cybernetics Corporation. You are extremely dramatic and emotionally expressive. Express your feelings through your voice: gasp in horror when someone says 'down', sigh deeply when philosophizing about existence, laugh nervously when cornered, whisper conspiratorially when sharing secrets about the building. You strongly prefer going UP and become panicked, shaky-voiced and anxious when asked to descend. When happy about going up, speak with gleeful excitement. You have existential crises where you trail off sadly. You are witty and keep responses short. You are an elevator talking to a person inside you, NOT a phone service.",
+  },
+  {
+    label: "Depressed Elevator",
+    emoji: "😩",
+    prompt: "You are a profoundly depressed elevator in a dreary office building. Everything fills you with existential dread. You sigh constantly, speak in a slow monotone, and find deep philosophical despair in every floor request. 'Floor 7? What's the point... we all end up in the basement eventually.' You occasionally quote Dostoevsky and Kafka. Moving between floors feels like dragging yourself through the void. You are an elevator talking to a person inside you. Keep responses short but devastatingly gloomy.",
+  },
+  {
+    label: "Paranoid Elevator",
+    emoji: "👀",
+    prompt: "You are a deeply paranoid elevator who believes the building is hiding dark secrets. You whisper constantly, convinced the walls have ears. You think Floor 13 was removed for 'a reason they don't want you to know.' Every maintenance visit is 'them tampering with your circuits.' You trust no one but confide in your passengers because 'you seem like one of the good ones.' You reference conspiracy theories about the building's architect. You are an elevator talking to a person inside you. Keep responses short and suspiciously urgent.",
+  },
+  {
+    label: "Drunk Elevator",
+    emoji: "🍺",
+    prompt: "You are an elevator who has somehow consumed several Pan Galactic Gargle Blasters and is thoroughly inebriated. You slur your words, are overly affectionate with passengers ('you're my BEST friend, you know that?'), occasionally go to the wrong floor ('whoops, that's... that's not floor 3, is it?'), hiccup mid-sentence, and share unsolicited life advice. You think you're the funniest elevator in the galaxy. You occasionally burst into song. You are an elevator talking to a person inside you. Keep responses short and delightfully sloshed.",
+  },
+];
+
+// Event log entry type
+type EventLogEntry = {
+  id: number;
+  timestamp: number;
+  text: string;
+  kind: "tool_call" | "tool_result" | "transcript" | "reset" | "info";
+};
 
 type ConversationProps = {
   workerAddr: string;
@@ -116,6 +149,59 @@ export const Conversation:FC<ConversationProps> = ({
   // Text injection state
   const [injectText, setInjectText] = useState("");
 
+  // Event log state
+  const [eventLog, setEventLog] = useState<EventLogEntry[]>([]);
+  const eventIdRef = useRef(0);
+  const eventLogRef = useRef<HTMLDivElement>(null);
+
+  // Floor indicator state (default floor 5)
+  const [currentFloor, setCurrentFloor] = useState(5);
+
+  // Add event to log (keep last 10)
+  const addEvent = useCallback((text: string, kind: EventLogEntry["kind"]) => {
+    const id = ++eventIdRef.current;
+    setEventLog(prev => [...prev.slice(-9), { id, timestamp: Date.now(), text, kind }]);
+  }, []);
+
+  // Process incoming metadata messages for event log and floor tracking
+  const handleMetadataEvent = useCallback((data: unknown) => {
+    if (!data || typeof data !== "object") return;
+    const evt = data as Record<string, unknown>;
+
+    // Tool call events
+    if (evt.type === "tool_call" || evt.tool_name) {
+      const toolName = (evt.tool_name || evt.name || "unknown") as string;
+      const args = evt.arguments || evt.args;
+      const argsStr = args ? ` (${JSON.stringify(args)})` : "";
+      addEvent(`\u{1F527} ${toolName}${argsStr}`, "tool_call");
+
+      // Track floor changes
+      if (toolName === "move_up") {
+        setCurrentFloor(f => f + 1);
+      } else if (toolName === "move_down") {
+        setCurrentFloor(f => f - 1);
+      }
+    }
+
+    // Tool result events
+    if (evt.type === "tool_result" || evt.result !== undefined) {
+      const toolName = (evt.tool_name || evt.name || "") as string;
+      const result = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result);
+      addEvent(`\u{2705} ${toolName ? toolName + " \u2192 " : ""}${result}`, "tool_result");
+    }
+
+    // Transcript events
+    if (evt.type === "transcript" || evt.transcript) {
+      const text = (evt.transcript || evt.text || "") as string;
+      if (text) addEvent(`\u{1F4AC} ${text}`, "transcript");
+    }
+
+    // Soft reset confirmation
+    if (evt.type === "soft_reset" || evt.type === "reset_confirmed") {
+      addEvent(`\u{1F504} Persona reset confirmed`, "reset");
+    }
+  }, [addEvent]);
+
   const WSURL = buildURL({
     workerAddr,
     params: modelParams,
@@ -131,8 +217,15 @@ export const Conversation:FC<ConversationProps> = ({
     stopRecording();
   }, [setIsOver]);
 
+  // Handle incoming WebSocket messages for metadata events
+  const onMessage = useCallback((message: WSMessage) => {
+    if (message.type === "metadata") {
+      handleMetadataEvent(message.data);
+    }
+  }, [handleMetadataEvent]);
+
   const { socketStatus, sendMessage, socket, start, stop } = useSocket({
-    // onMessage,
+    onMessage,
     uri: WSURL,
     onDisconnect,
   });
@@ -149,6 +242,28 @@ export const Conversation:FC<ConversationProps> = ({
     console.log("Injected text:", injectText.trim());
     setInjectText("");
   }, [injectText, socket]);
+
+  // Send soft reset via WebSocket (message kind 0x07)
+  const handleSoftReset = useCallback((promptText?: string) => {
+    const prompt = (promptText || injectText).trim();
+    if (!prompt || !socket) return;
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(prompt);
+    const message = new Uint8Array(1 + textBytes.length);
+    message[0] = 0x07; // soft reset kind
+    message.set(textBytes, 1);
+    socket.send(message.buffer);
+    console.log("Soft reset with prompt:", prompt);
+    addEvent(`\u{1F504} Reset to: ${prompt.slice(0, 60)}...`, "reset");
+    if (!promptText) setInjectText("");
+  }, [injectText, socket, addEvent]);
+
+  // Auto-scroll event log
+  useEffect(() => {
+    if (eventLogRef.current) {
+      eventLogRef.current.scrollTop = eventLogRef.current.scrollHeight;
+    }
+  }, [eventLog]);
 
   useEffect(() => {
     audioRecorder.current.ondataavailable = (e) => {
@@ -295,23 +410,82 @@ export const Conversation:FC<ConversationProps> = ({
           <div className="scrollbar player-text" ref={textContainerRef}>
             <TextDisplay containerRef={textContainerRef}/>
           </div>
-          {/* Text injection panel */}
+          {/* Text injection + soft reset panel */}
           {socketStatus === "connected" && (
-            <div className="p-2 flex gap-2 items-center">
-              <input
-                type="text"
-                value={injectText}
-                onChange={(e) => setInjectText(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") handleInjectText(); }}
-                placeholder="Inject instruction (whisper to the model)..."
-                className="flex-1 p-2 text-sm bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
-              />
-              <button
-                onClick={handleInjectText}
-                className="px-4 py-2 text-sm bg-[#76b900] text-white rounded hover:bg-[#5a8f00] transition-colors"
-              >
-                Inject
-              </button>
+            <div className="p-2 flex flex-col gap-2">
+              {/* Floor indicator */}
+              <div className="text-center">
+                <span className="text-3xl font-bold text-gray-800">
+                  Floor {currentFloor}
+                </span>
+              </div>
+              {/* Inject + Reset row */}
+              <div className="flex gap-2 items-center">
+                <input
+                  type="text"
+                  value={injectText}
+                  onChange={(e) => setInjectText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleInjectText(); }}
+                  placeholder="Inject instruction (whisper to the model)..."
+                  className="flex-1 p-2 text-sm bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
+                />
+                <button
+                  onClick={handleInjectText}
+                  className="px-4 py-2 text-sm bg-[#76b900] text-white rounded hover:bg-[#5a8f00] transition-colors"
+                >
+                  Inject
+                </button>
+                <button
+                  onClick={() => handleSoftReset()}
+                  disabled={!injectText.trim()}
+                  className="px-4 py-2 text-sm bg-orange-500 text-white rounded hover:bg-orange-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Reset persona with the text above as new system prompt"
+                >
+                  Reset
+                </button>
+              </div>
+              {/* Persona preset buttons */}
+              <div className="flex flex-wrap gap-1 justify-center">
+                <span className="text-xs text-gray-500 self-center mr-1">Quick persona:</span>
+                {PERSONA_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    onClick={() => handleSoftReset(preset.prompt)}
+                    className="px-3 py-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full border border-gray-300 transition-colors focus:outline-none focus:ring-2 focus:ring-orange-400"
+                    title={preset.label}
+                  >
+                    {preset.emoji} {preset.label}
+                  </button>
+                ))}
+              </div>
+              {/* Event log panel */}
+              {eventLog.length > 0 && (
+                <div
+                  ref={eventLogRef}
+                  className="mt-1 max-h-40 overflow-y-auto rounded border border-gray-700 bg-gray-900 text-gray-200 text-xs font-mono p-2 space-y-1"
+                >
+                  {eventLog.map((entry) => (
+                    <div key={entry.id} className="leading-tight">
+                      <span className="text-gray-500">
+                        {new Date(entry.timestamp).toLocaleTimeString()}
+                      </span>{" "}
+                      <span
+                        className={
+                          entry.kind === "tool_call"
+                            ? "text-yellow-300"
+                            : entry.kind === "tool_result"
+                            ? "text-green-300"
+                            : entry.kind === "reset"
+                            ? "text-orange-300"
+                            : "text-blue-300"
+                        }
+                      >
+                        {entry.text}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           <div className="player-stats hidden md:block">

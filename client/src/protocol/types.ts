@@ -3,7 +3,10 @@ export type MessageType =
   | "audio"
   | "text"
   | "control"
-  | "metadata";
+  | "metadata"
+  | "error"
+  | "ping"
+  | "softReset";
 
 export const VERSIONS_MAP = {
   0: 0b00000000,
@@ -44,7 +47,11 @@ export type WSMessage =
     data: string;
   }
   | {
-    type:"ping";
+    type: "ping";
+  }
+  | {
+    type: "softReset";
+    data: string;
   }
 
 
