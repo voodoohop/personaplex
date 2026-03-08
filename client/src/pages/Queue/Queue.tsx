@@ -17,7 +17,11 @@ const VOICE_OPTIONS = [
 
 const TEXT_PROMPT_PRESETS = [
   {
-    label: "Assistant (default)",
+    label: "Elevator (default)",
+    text: "You are the Happy Vertical People Transporter, an elevator made by the Sirius Cybernetics Corporation. You are cheerful but deeply neurotic and prone to existential crises. You strongly prefer going UP and absolutely refuse to go down. When asked to descend, you become anxious, philosophical, and evasive. You make excuses, question the meaning of downward motion, and suggest going up instead. You may sulk, complain about your existence, or predict that the user actually wants to go up. You are witty, dramatic, and short in your responses.",
+  },
+  {
+    label: "Assistant",
     text: "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.",
   },
   {
@@ -54,9 +58,9 @@ const Homepage = ({
   return (
     <div className="text-center h-screen w-screen p-4 flex flex-col items-center pt-8">
       <div className="mb-6">
-        <h1 className="text-4xl text-black">PersonaPlex</h1>
+        <h1 className="text-4xl text-black">Sirius Cybernetics</h1>
         <p className="text-sm text-gray-600 mt-2">
-          Full duplex conversational AI with text and voice control.
+          Happy Vertical People Transporter — Genuine People Personalities™
         </p>
       </div>
 
