@@ -318,7 +318,7 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
-            nonlocal pending_reset_prompt
+            nonlocal pending_reset_prompt, opus_writer, opus_reader
             all_pcm_data = None
 
             while True:
