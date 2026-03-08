@@ -27,9 +27,11 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
+import re
 import tarfile
 import time
 import secrets
@@ -86,6 +88,91 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+# ---------------------------------------------------------------------------
+# Tool calling infrastructure
+# ---------------------------------------------------------------------------
+
+class TextAccumulator:
+    """Buffers model output text tokens until a sentence boundary is detected."""
+
+    # Sentence-ending punctuation (covers English and common unicode)
+    _SENTENCE_END_RE = re.compile(r'[.!?]\s*$')
+
+    def __init__(self):
+        self._buf: list[str] = []
+
+    def add(self, piece: str) -> Optional[str]:
+        """Append *piece* and return the accumulated sentence if a boundary is
+        detected, otherwise ``None``."""
+        self._buf.append(piece)
+        text = "".join(self._buf)
+        if self._SENTENCE_END_RE.search(text):
+            self._buf.clear()
+            return text.strip()
+        return None
+
+    def flush(self) -> Optional[str]:
+        """Return whatever is buffered (if any) and reset."""
+        if not self._buf:
+            return None
+        text = "".join(self._buf).strip()
+        self._buf.clear()
+        return text if text else None
+
+
+def _make_elevator_tools():
+    """Return (registry, state) for the built-in elevator game."""
+    state = {"floor": 1}
+
+    def move_up(_args):
+        state["floor"] = min(state["floor"] + 1, 100)
+        return f"Moving up to floor {state['floor']}"
+
+    def move_down(_args):
+        state["floor"] = max(state["floor"] - 1, -2)
+        return f"Moving down to floor {state['floor']}"
+
+    def get_floor(_args):
+        return f"Currently on floor {state['floor']}"
+
+    registry = {
+        "move_up": move_up,
+        "move_down": move_down,
+        "get_floor": get_floor,
+    }
+    return registry, state
+
+
+# Simple regex patterns for intent detection
+_TOOL_PATTERNS = [
+    (re.compile(r'\b(?:go|move|take me|going)\s+up\b', re.IGNORECASE), "move_up"),
+    (re.compile(r'\b(?:go|move|take me|going)\s+down\b', re.IGNORECASE), "move_down"),
+    (re.compile(r'\b(?:what|which)\s+floor\b', re.IGNORECASE), "get_floor"),
+    (re.compile(r'\bcurrent\s+floor\b', re.IGNORECASE), "get_floor"),
+]
+
+
+def detect_tool_intent(text: str) -> Optional[str]:
+    """Return tool name if *text* matches a known intent pattern, else None."""
+    for pattern, tool_name in _TOOL_PATTERNS:
+        if pattern.search(text):
+            return tool_name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WebSocket event helpers (message kind 0x04)
+# ---------------------------------------------------------------------------
+
+async def _send_event(ws, event: dict) -> None:
+    """Send a JSON event to the client as message kind 0x04."""
+    try:
+        payload = json.dumps(event).encode("utf-8")
+        await ws.send_bytes(b"\x04" + payload)
+    except Exception:
+        pass  # connection may already be closed
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -96,12 +183,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, enable_tools: bool = False):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.enable_tools = enable_tools
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -170,9 +258,19 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
+        # Per-session tool state
+        tool_registry = None
+        tool_state = None
+        text_accumulator = None
+        if self.enable_tools:
+            tool_registry, tool_state = _make_elevator_tools()
+            text_accumulator = TextAccumulator()
+
+        # Soft-reset support: when set, opus_loop will pick it up
+        pending_reset_prompt = None
 
         async def recv_loop():
-            nonlocal close
+            nonlocal close, pending_reset_prompt
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.ERROR:
@@ -200,8 +298,15 @@ class ServerState:
                         payload = message[1:]
                         text = payload.decode("utf-8")
                         clog.log("info", f"text injection: {text}")
-                        tokens = self.text_tokenizer.encode(text)
+                        wrapped = wrap_with_system_tags(text)
+                        tokens = self.text_tokenizer.encode(wrapped)
                         self.lm_gen.inject_text_tokens(tokens)
+                    elif kind == 7:  # soft reset (0x07)
+                        payload = message[1:]
+                        new_prompt = payload.decode("utf-8")
+                        clog.log("info", f"soft reset requested: {new_prompt}")
+                        pending_reset_prompt = new_prompt
+                        await _send_event(ws, {"kind": "soft_reset", "prompt": new_prompt})
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -209,11 +314,41 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
+            nonlocal pending_reset_prompt
             all_pcm_data = None
 
             while True:
                 if close:
                     return
+
+                # ---- Soft reset handling ----
+                if pending_reset_prompt is not None:
+                    new_prompt = pending_reset_prompt
+                    pending_reset_prompt = None
+                    clog.log("info", f"performing soft reset with prompt: {new_prompt}")
+
+                    # Re-tokenize new prompt with system tags
+                    self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
+                        wrap_with_system_tags(new_prompt)
+                    )
+
+                    # Reset streaming states
+                    self.mimi.reset_streaming()
+                    self.other_mimi.reset_streaming()
+                    self.lm_gen.reset_streaming()
+
+                    # Re-run system prompt stepping
+                    async def is_alive_inner():
+                        return not close and not ws.closed
+
+                    await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_inner)
+                    self.mimi.reset_streaming()
+                    clog.log("info", "soft reset complete")
+
+                    # Discard any buffered PCM from before the reset
+                    all_pcm_data = None
+                    continue
+
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
@@ -242,9 +377,28 @@ class ServerState:
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                            _text = _text.replace("▁", " ")
+                            _text = _text.replace("\u2581", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             await ws.send_bytes(msg)
+
+                            # Tool detection on accumulated text
+                            if text_accumulator is not None:
+                                sentence = text_accumulator.add(_text)
+                                if sentence:
+                                    await _send_event(ws, {"kind": "assistant_text", "text": sentence})
+                                    tool_name = detect_tool_intent(sentence)
+                                    if tool_name and tool_registry and tool_name in tool_registry:
+                                        result = tool_registry[tool_name](None)
+                                        clog.log("info", f"tool call: {tool_name} -> {result}")
+                                        await _send_event(ws, {
+                                            "kind": "tool_call",
+                                            "tool": tool_name,
+                                            "result": result,
+                                        })
+                                        # Inject tool result back into the model
+                                        result_wrapped = wrap_with_system_tags(f"Tool result: {result}")
+                                        result_tokens = self.text_tokenizer.encode(result_wrapped)
+                                        self.lm_gen.inject_text_tokens(result_tokens)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
@@ -281,7 +435,7 @@ class ServerState:
                     if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         return False
                 except asyncio.TimeoutError:
-                    # No messages → client probably still alive
+                    # No messages -> client probably still alive
                     return True
                 except aiohttp.ClientConnectionError:
                     return False
@@ -397,6 +551,12 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--tools",
+        action="store_true",
+        default=False,
+        help="Enable tool calling infrastructure (elevator game built-in tools).",
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -460,6 +620,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        enable_tools=args.tools,
     )
     logger.info("warming up the model")
     state.warmup()

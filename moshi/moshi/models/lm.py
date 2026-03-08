@@ -815,7 +815,12 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def inject_text_tokens(self, tokens: list[int], pad_frames: int = 4) -> None:
-        """Queue text tokens for injection with silence padding."""
+        """Queue text tokens for injection with silence padding.
+
+        Tokens are stepped through the LM paired with sine-wave user audio
+        and zero (silence) moshi audio codes so that mimi's streaming state
+        stays synchronised.
+        """
         for _ in range(pad_frames):
             self._pending_text_tokens.append(self.zero_text_code)
         self._pending_text_tokens.extend(tokens)
@@ -1001,6 +1006,8 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache = state["cache"].to(self.lm_model.device)
 
     def _encode_zero_frame(self) -> torch.Tensor:
+        """Return silence audio codes for the moshi (agent) side.
+        Shape: (1, 8, 1)."""
         return torch.as_tensor(
             SILENCE_TOKENS,
             dtype=torch.long,
@@ -1008,6 +1015,8 @@ class LMGen(StreamingModule[_LMGenState]):
         ).view(1, 8, 1)
 
     def _encode_sine_frame(self) -> torch.Tensor:
+        """Return a 1-frame sine wave encoded as audio codes for fake user
+        audio during injection. Shape: (1, 8, 1)."""
         return torch.as_tensor(
             SINE_TOKENS,
             dtype=torch.long,
@@ -1193,4 +1202,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-
