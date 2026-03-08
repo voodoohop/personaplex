@@ -26,7 +26,6 @@
 
 import argparse
 import asyncio
-from collections import deque
 from dataclasses import dataclass
 import random
 import os
@@ -171,8 +170,6 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
-        # Queue for injecting text tokens mid-conversation
-        inject_token_queue = deque()
 
         async def recv_loop():
             nonlocal close
@@ -203,10 +200,8 @@ class ServerState:
                         payload = message[1:]
                         text = payload.decode("utf-8")
                         clog.log("info", f"text injection: {text}")
-                        # Wrap with system tags and tokenize
-                        wrapped = wrap_with_system_tags(text)
-                        tokens = self.text_tokenizer.encode(wrapped)
-                        inject_token_queue.extend(tokens)
+                        tokens = self.text_tokenizer.encode(text)
+                        self.lm_gen.inject_text_tokens(tokens)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -236,11 +231,7 @@ class ServerState:
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
-                        # Check if we have text tokens to inject
-                        text_token = None
-                        if inject_token_queue:
-                            text_token = inject_token_queue.popleft()
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1], text_token=text_token)
+                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
