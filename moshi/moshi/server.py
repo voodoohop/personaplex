@@ -122,15 +122,19 @@ class TextAccumulator:
 
 def _make_elevator_tools():
     """Return (registry, state) for the built-in elevator game."""
-    state = {"floor": 1}
+    state = {"floor": 5}
 
     def move_up(_args):
-        state["floor"] = min(state["floor"] + 1, 100)
-        return f"Moving up to floor {state['floor']}"
+        if state["floor"] >= 5:
+            return f"Already at the top floor {state['floor']}"
+        state["floor"] = min(state["floor"] + 1, 5)
+        return f"Now on floor {state['floor']}"
 
     def move_down(_args):
-        state["floor"] = max(state["floor"] - 1, -2)
-        return f"Moving down to floor {state['floor']}"
+        if state["floor"] <= 1:
+            return f"Already at the ground floor {state['floor']}"
+        state["floor"] = max(state["floor"] - 1, 1)
+        return f"Now on floor {state['floor']}"
 
     def get_floor(_args):
         return f"Currently on floor {state['floor']}"
@@ -343,6 +347,15 @@ class ServerState:
 
                     await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_inner)
                     self.mimi.reset_streaming()
+
+                    # Flush stale audio buffers from before the reset
+                    opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
+                    opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+
+                    # Reset text accumulator if present
+                    if text_accumulator is not None:
+                        text_accumulator.flush()
+
                     clog.log("info", "soft reset complete")
 
                     # Discard any buffered PCM from before the reset
@@ -372,6 +385,12 @@ class ServerState:
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
+
+                        # Don't forward audio/text while injecting tokens
+                        # (injection forces text tokens; the audio is garbage during this)
+                        if self.lm_gen.is_injecting:
+                            continue
+
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
@@ -395,10 +414,8 @@ class ServerState:
                                             "tool": tool_name,
                                             "result": result,
                                         })
-                                        # Inject tool result back into the model
-                                        result_wrapped = wrap_with_system_tags(f"Tool result: {result}")
-                                        result_tokens = self.text_tokenizer.encode(result_wrapped)
-                                        self.lm_gen.inject_text_tokens(result_tokens)
+                                        # Flush the text accumulator to avoid re-triggering
+                                        text_accumulator.flush()
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
