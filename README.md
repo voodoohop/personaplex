@@ -1,3 +1,39 @@
+# PersonaPlex (voodoohop fork)
+
+> Fork of [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex) with deployment fixes.
+
+## Changes in this fork
+
+- **Enable UI parameter controls** — The Web UI sliders for `audio_temperature`, `text_temperature`, `text_topk`, and `audio_topk` were commented out in the upstream code, meaning the UI controls had no effect. We uncommented them so they actually work.
+- **Deployment notes** — Tested on Vast.ai RTX 4090 (24GB VRAM) with `sphn==0.1.12` (sphn 0.2.x has breaking API changes). Use `cloudflared` tunnel for low-latency public access without SSH.
+
+### Quick deploy on Vast.ai
+
+```bash
+# 1. Create instance (RTX 3090/4090, Ubuntu 22.04)
+# 2. Install deps
+apt-get install -y libopus-dev git gcc g++ python3-pip python3-dev screen
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /lib/x86_64-linux-gnu/libcuda.so
+
+# 3. Clone and install
+git clone https://github.com/voodoohop/personaplex.git
+cd personaplex
+pip install -e moshi/. --no-deps
+pip install 'numpy>=1.26,<2.2' 'safetensors>=0.4.0,<0.5' 'huggingface-hub>=0.24,<0.25' \
+  'einops==0.7' 'sentencepiece==0.2' 'sounddevice==0.5' 'sphn>=0.1.4,<0.2' 'aiohttp>=3.10.5,<3.11'
+
+# 4. Run (accept HF license first: https://huggingface.co/nvidia/personaplex-7b-v1)
+export HF_TOKEN=<your_token>
+SSL_DIR=$(mktemp -d)
+python3 -m moshi.server --host 0.0.0.0 --ssl "$SSL_DIR"
+
+# 5. Optional: public URL via cloudflare tunnel
+cloudflared tunnel --url https://localhost:8998 --no-tls-verify
+```
+
+---
+
 # PersonaPlex: Voice and Role Control for Full Duplex Conversational Speech Models
 
 [![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
