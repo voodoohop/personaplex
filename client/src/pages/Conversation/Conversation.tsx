@@ -139,13 +139,13 @@ export const Conversation:FC<ConversationProps> = ({
 
   // Send text injection via WebSocket (message kind 0x02)
   const handleInjectText = useCallback(() => {
-    if (!injectText.trim() || !socket.current) return;
+    if (!injectText.trim() || !socket) return;
     const encoder = new TextEncoder();
     const textBytes = encoder.encode(injectText.trim());
     const message = new Uint8Array(1 + textBytes.length);
     message[0] = 0x02; // text injection kind
     message.set(textBytes, 1);
-    socket.current.send(message.buffer);
+    socket.send(message.buffer);
     console.log("Injected text:", injectText.trim());
     setInjectText("");
   }, [injectText, socket]);
