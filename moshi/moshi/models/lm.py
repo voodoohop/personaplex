@@ -36,6 +36,7 @@ from os.path import splitext
 import logging
 import numpy as np
 import sys
+from collections import deque
 from typing import Optional, Union, List, Tuple, Callable, Iterator
 import sphn
 import torch
@@ -697,6 +698,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        self._pending_text_tokens: deque[int] = deque()
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
@@ -812,11 +814,26 @@ class LMGen(StreamingModule[_LMGenState]):
         return input_, provided_, target_, model_input_position, target_position
 
     @torch.no_grad()
+    def inject_text_tokens(self, tokens: list[int], pad_frames: int = 4) -> None:
+        """Queue text tokens for injection with silence padding."""
+        for _ in range(pad_frames):
+            self._pending_text_tokens.append(self.zero_text_code)
+        self._pending_text_tokens.extend(tokens)
+        for _ in range(pad_frames):
+            self._pending_text_tokens.append(self.zero_text_code)
+
+    @property
+    def is_injecting(self) -> bool:
+        return len(self._pending_text_tokens) > 0
+
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
              return_embeddings: bool=False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
+        # Auto-consume from pending text token queue
+        if text_token is None and self._pending_text_tokens:
+            text_token = self._pending_text_tokens.popleft()
         prepared_inputs = self.prepare_step_input(
             input_tokens, moshi_tokens, text_token,
         )
@@ -973,6 +990,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio = raw_audio
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
+        self._pending_text_tokens: deque[int] = deque()
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
