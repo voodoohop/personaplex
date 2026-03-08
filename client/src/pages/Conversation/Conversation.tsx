@@ -113,6 +113,9 @@ export const Conversation:FC<ConversationProps> = ({
   const textSeed = useMemo(() => Math.round(1000000 * Math.random()), []);
   const audioSeed = useMemo(() => Math.round(1000000 * Math.random()), []);
 
+  // Text injection state
+  const [injectText, setInjectText] = useState("");
+
   const WSURL = buildURL({
     workerAddr,
     params: modelParams,
@@ -133,6 +136,20 @@ export const Conversation:FC<ConversationProps> = ({
     uri: WSURL,
     onDisconnect,
   });
+
+  // Send text injection via WebSocket (message kind 0x02)
+  const handleInjectText = useCallback(() => {
+    if (!injectText.trim() || !socket.current) return;
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(injectText.trim());
+    const message = new Uint8Array(1 + textBytes.length);
+    message[0] = 0x02; // text injection kind
+    message.set(textBytes, 1);
+    socket.current.send(message.buffer);
+    console.log("Injected text:", injectText.trim());
+    setInjectText("");
+  }, [injectText, socket]);
+
   useEffect(() => {
     audioRecorder.current.ondataavailable = (e) => {
       audioChunks.current.push(e.data);
@@ -278,6 +295,25 @@ export const Conversation:FC<ConversationProps> = ({
           <div className="scrollbar player-text" ref={textContainerRef}>
             <TextDisplay containerRef={textContainerRef}/>
           </div>
+          {/* Text injection panel */}
+          {socketStatus === "connected" && (
+            <div className="p-2 flex gap-2 items-center">
+              <input
+                type="text"
+                value={injectText}
+                onChange={(e) => setInjectText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleInjectText(); }}
+                placeholder="Inject instruction (whisper to the model)..."
+                className="flex-1 p-2 text-sm bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
+              />
+              <button
+                onClick={handleInjectText}
+                className="px-4 py-2 text-sm bg-[#76b900] text-white rounded hover:bg-[#5a8f00] transition-colors"
+              >
+                Inject
+              </button>
+            </div>
+          )}
           <div className="player-stats hidden md:block">
             <ServerAudioStats getAudioStats={getAudioStats} />
           </div></MediaContext.Provider>}
